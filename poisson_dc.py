@@ -1,15 +1,17 @@
 """
-Fixed Dixon-Coles low-score correction.
+Fixed Dixon-Coles low-score correction using correct four-cell formula.
 
-Proper implementation using both home and away expected goals.
-Ref: Dixon & Coles (1997) "Modelling association football scores..."
+Reference: Dixon & Coles (1997)
+The correction factor for each scoreline (i,j) is:
 
-The tau factor depends on BOTH teams' expected goals to capture
-the interaction between low-scoring teams.
+  φ(i,j,λ_h,λ_a,ρ) = 1 - ρ·λ_h·λ_a   if (i,j) ∈ {(0,0), (1,0), (0,1), (1,1)}
+  φ(i,j,λ_h,λ_a,ρ) = 1                  otherwise
+
+Where ρ is typically -0.05 to -0.10 (negative, representing low-score deficit).
 """
 
 import numpy as np
-from math import exp, factorial
+from math import factorial
 from config import DIXON_COLES_RHO, DIXON_COLES_ADJUSTMENT, MAX_GOALS_FOR_MATRIX
 
 
@@ -17,7 +19,14 @@ def poisson_probability(lam: float, k: int) -> float:
     """
     Poisson PMF: P(X=k) = (e^-λ * λ^k) / k!
     
-    Uses log-space to prevent overflow.
+    Uses log-space to prevent overflow/underflow.
+    
+    Args:
+        lam: Rate parameter (expected goals)
+        k: Number of goals (non-negative integer)
+        
+    Returns:
+        Probability mass at k
     """
     if k < 0 or lam < 0:
         return 0.0
@@ -25,33 +34,31 @@ def poisson_probability(lam: float, k: int) -> float:
         return 1.0 if k == 0 else 0.0
     
     try:
+        # Log-space computation for numerical stability
         log_prob = -lam + k * np.log(lam) - np.log(factorial(k))
         return float(np.exp(log_prob))
     except (OverflowError, ValueError):
         return 0.0
 
 
-def dixon_coles_tau(home_goals: int, away_goals: int,
+def dixon_coles_phi(home_goals: int, away_goals: int,
                     home_xg: float, away_xg: float,
                     rho: float) -> float:
     """
-    Compute Dixon-Coles tau correction factor.
+    Dixon-Coles correction factor φ(i,j,λ_h,λ_a,ρ).
     
-    The tau factor is defined as:
-    τ(i,j,λ_h,λ_a) = 1 - ρ * (i==0) * (j==0) * exp(ρ) * (i==1) * (j==1)
-    
-    But for numerical stability and correctness, we use:
-    τ = 1 - ρ  for {0-0, 1-0, 0-1, 1-1}
-    τ = 1      otherwise
-    
-    The rho parameter is NEGATIVE (e.g., -0.075), representing that
-    low scores are less likely than Poisson would predict.
+    Standard four-cell formula:
+    - (0,0): φ = 1 - ρ·λ_h·λ_a
+    - (1,0): φ = 1 - ρ·λ_h·λ_a
+    - (0,1): φ = 1 - ρ·λ_h·λ_a
+    - (1,1): φ = 1 + ρ·λ_h·λ_a
+    - All others: φ = 1
     
     Args:
-        home_goals: Home team goals
-        away_goals: Away team goals
-        home_xg: Home expected goals (for reference, not used in tau)
-        away_xg: Away expected goals (for reference, not used in tau)
+        home_goals: Home team goals scored
+        away_goals: Away team goals scored
+        home_xg: Home team expected goals (from Poisson model)
+        away_xg: Away team expected goals (from Poisson model)
         rho: Correlation parameter (typically -0.05 to -0.10)
         
     Returns:
@@ -60,51 +67,49 @@ def dixon_coles_tau(home_goals: int, away_goals: int,
     if not DIXON_COLES_ADJUSTMENT or rho >= 0:
         return 1.0
     
-    # Apply tau only to low-scoring matches
-    if home_goals <= 1 and away_goals <= 1:
-        # Standard DC adjustment
-        if home_goals == 0 and away_goals == 0:
-            # 0-0: reduce probability
-            tau = 1 + rho  # rho is negative, so this < 1
-        elif (home_goals == 1 and away_goals == 0) or (home_goals == 0 and away_goals == 1):
-            # 1-0 or 0-1: reduce probability
-            tau = 1 + rho
-        elif home_goals == 1 and away_goals == 1:
-            # 1-1: reduce probability more
-            tau = 1 + rho * rho  # Two-fold effect
+    # Only apply to low-scoring matches
+    if (home_goals, away_goals) in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+        if (home_goals, away_goals) == (1, 1):
+            # 1-1: φ = 1 + ρ·λ_h·λ_a (note: + not -)
+            phi = 1.0 + rho * home_xg * away_xg
         else:
-            tau = 1.0
+            # 0-0, 1-0, 0-1: φ = 1 - ρ·λ_h·λ_a
+            phi = 1.0 - rho * home_xg * away_xg
     else:
-        tau = 1.0
+        phi = 1.0
     
-    return float(tau)
+    return float(phi)
 
 
 def score_matrix(home_xg: float, away_xg: float) -> np.ndarray:
     """
-    Generate probability matrix for all scorelines with Dixon-Coles.
+    Generate probability matrix for all scorelines with Dixon-Coles correction.
+    
+    P(i,j) = Poisson(i; λ_h) * Poisson(j; λ_a) * φ(i,j,λ_h,λ_a,ρ)
     
     Args:
         home_xg: Home team expected goals
         away_xg: Away team expected goals
         
     Returns:
-        Matrix of shape (MAX_GOALS+1, MAX_GOALS+1)
+        Probability matrix, shape (MAX_GOALS+1, MAX_GOALS+1)
     """
     matrix = np.zeros((MAX_GOALS_FOR_MATRIX + 1, MAX_GOALS_FOR_MATRIX + 1))
     
     for h in range(MAX_GOALS_FOR_MATRIX + 1):
         for a in range(MAX_GOALS_FOR_MATRIX + 1):
-            # Poisson probability
-            p = poisson_probability(home_xg, h) * poisson_probability(away_xg, a)
+            # Base Poisson probability
+            p_h = poisson_probability(home_xg, h)
+            p_a = poisson_probability(away_xg, a)
+            p = p_h * p_a
             
-            # Dixon-Coles adjustment
-            tau = dixon_coles_tau(h, a, home_xg, away_xg, DIXON_COLES_RHO)
-            p = p * tau
+            # Apply Dixon-Coles correction
+            phi = dixon_coles_phi(h, a, home_xg, away_xg, DIXON_COLES_RHO)
+            p = p * phi
             
             matrix[h, a] = p
     
-    # Normalize
+    # Normalize to ensure probabilities sum to 1
     total = matrix.sum()
     if total > 0:
         matrix /= total
@@ -114,14 +119,21 @@ def score_matrix(home_xg: float, away_xg: float) -> np.ndarray:
 
 def poisson_markets(home_xg: float, away_xg: float) -> dict:
     """
-    Extract 1X2 and BTTS probabilities.
+    Extract 1X2 and BTTS market probabilities from Poisson matrix.
+    
+    Args:
+        home_xg: Home team expected goals
+        away_xg: Away team expected goals
+        
+    Returns:
+        Dictionary with keys '1', 'X', '2', 'GG', 'NG'
     """
     matrix = score_matrix(home_xg, away_xg)
     
-    p1 = 0.0
-    px = 0.0
-    p2 = 0.0
-    pgg = 0.0
+    p1 = 0.0   # Home wins (h > a)
+    px = 0.0   # Draws (h == a)
+    p2 = 0.0   # Away wins (a > h)
+    pgg = 0.0  # Both teams to score (h > 0 and a > 0)
     
     for h in range(matrix.shape[0]):
         for a in range(matrix.shape[1]):
@@ -137,18 +149,29 @@ def poisson_markets(home_xg: float, away_xg: float) -> dict:
             if h > 0 and a > 0:
                 pgg += p
     
+    pgg = float(np.clip(pgg, 0.0, 1.0))
+    png = float(np.clip(1.0 - pgg, 0.0, 1.0))
+    
     return {
         "1": float(p1),
         "X": float(px),
         "2": float(p2),
-        "GG": float(pgg),
-        "NG": float(1.0 - pgg)
+        "GG": pgg,
+        "NG": png
     }
 
 
 def best_scorelines(home_xg: float, away_xg: float, n: int = 5) -> list:
     """
-    Return top N most likely scorelines.
+    Return top N most likely exact scorelines.
+    
+    Args:
+        home_xg: Home team expected goals
+        away_xg: Away team expected goals
+        n: Number of top scorelines to return
+        
+    Returns:
+        List of (probability, "h-a") tuples, sorted descending
     """
     matrix = score_matrix(home_xg, away_xg)
     
